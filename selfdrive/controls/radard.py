@@ -29,6 +29,17 @@ V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 RADAR_TO_CENTER = 2.7   # (deprecated) RADAR is ~ 2.7m ahead from center of car
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
+# --- radar<->vision lead association (fusion) ---
+# The vision lead's distance both selects and gates the radar track it fuses with. At long range the model's
+# distance is noisy (swings >10m frame to frame) and the old gate was purely proportional (0.25 * dist, i.e.
+# ~25m at 100m) with no memory, so a *different*, closer radar object could drift in and out of the gate and
+# make the fused leadOne flip-flop between it and the vision-only lead. That injected phantom closing velocity
+# (spurious braking / refusing to close a gap). Three guards fix this while leaving the near-range braking
+# zone (where the 5m floor dominates) unchanged:
+MATCH_VISION_DIST_GATE_MAX = 12.0   # m, cap on the association distance gate (reject far-off / different objects)
+MATCH_VISION_DIST_RC = 0.3          # s, low-pass on the vision distance used for association (kills noise-driven toggling)
+MATCH_SWITCH_FRAMES = 3             # a newly-matched radar track must persist this many frames before it becomes the lead
+
 
 class KalmanParams:
   def __init__(self, dt: float):
@@ -119,8 +130,14 @@ def laplacian_pdf(x: float, mu: float, b: float):
   return math.exp(-abs(x-mu)/b)
 
 
-def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks: dict[int, Track]):
-  offset_vision_dist = lead.x[0] - RADAR_TO_CAMERA
+def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks: dict[int, Track], state: dict):
+  # Low-pass the vision distance used to pick and gate the radar track. The raw per-frame model distance is
+  # very noisy at range; gating on it is what let a closer object drift in/out of the gate. The reported
+  # leadOne distance downstream is still the raw radar/vision value, only the association uses the smoothed one.
+  raw_offset = lead.x[0] - RADAR_TO_CAMERA
+  offset_vision_dist = state.get('offset', raw_offset)
+  offset_vision_dist += (DT_MDL / (MATCH_VISION_DIST_RC + DT_MDL)) * (raw_offset - offset_vision_dist)
+  state['offset'] = offset_vision_dist
 
   def prob(c):
     prob_d = laplacian_pdf(c.dRel, offset_vision_dist, lead.xStd[0])
@@ -130,16 +147,36 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
     # This isn't exactly right, but it's a good heuristic
     return prob_d * prob_y * prob_v
 
-  track = max(tracks.values(), key=prob)
+  def is_sane(c):
+    # Cap the gate so a radar return that is much closer/farther than the vision lead (i.e. a different
+    # object) is not fused to it. Stationary radar points can be false positives.
+    dist_gate = min(max(offset_vision_dist * .25, 5.0), MATCH_VISION_DIST_GATE_MAX)
+    dist_sane = abs(c.dRel - offset_vision_dist) < dist_gate
+    vel_sane = (abs(c.vRel + v_ego - lead.v[0]) < 10) or (v_ego + c.vRel > 3)
+    return dist_sane and vel_sane
 
-  # if no 'sane' match is found return -1
-  # stationary radar points can be false positives
-  dist_sane = abs(track.dRel - offset_vision_dist) < max([(offset_vision_dist)*.25, 5.0])
-  vel_sane = (abs(track.vRel + v_ego - lead.v[0]) < 10) or (v_ego + track.vRel > 3)
-  if dist_sane and vel_sane:
-    return track
+  track = max(tracks.values(), key=prob)
+  if not is_sane(track):
+    track = None
+
+  # Association hysteresis: require a *new* radar track to be the best sane match for MATCH_SWITCH_FRAMES
+  # consecutive frames before it becomes the fused lead, holding the current one meanwhile. This stops
+  # single-frame associations from flip-flopping leadOne between two objects. Losing the current track
+  # (it disappears or goes insane) still drops immediately.
+  prev_id = state.get('track_id', -1)
+  cand_id = track.identifier if track is not None else -1
+  if cand_id != prev_id and cand_id != -1:
+    state['cand_cnt'] = state.get('cand_cnt', 0) + 1 if state.get('cand_id') == cand_id else 1
+    state['cand_id'] = cand_id
+    if state['cand_cnt'] < MATCH_SWITCH_FRAMES:
+      prev_track = tracks.get(prev_id)
+      track = prev_track if (prev_track is not None and is_sane(prev_track)) else None
   else:
-    return None
+    state['cand_id'] = cand_id
+    state['cand_cnt'] = 0
+
+  state['track_id'] = track.identifier if track is not None else -1
+  return track
 
 
 def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: float, model_v_ego: float, lead_prob: float):
@@ -162,12 +199,15 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
 
 def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capnp._DynamicStructReader,
              model_v_ego: float, lead_prob: float, CP: structs.CarParams, CP_SP: structs.CarParamsSP,
-             low_speed_override: bool = True) -> dict[str, Any]:
+             low_speed_override: bool = True, state: dict | None = None) -> dict[str, Any]:
   # Determine leads, this is where the essential logic happens
+  if state is None:
+    state = {}
   if len(tracks) > 0 and ready and lead_prob > .5:
-    track = match_vision_to_track(v_ego, lead_msg, tracks)
+    track = match_vision_to_track(v_ego, lead_msg, tracks, state)
   else:
     track = None
+    state.clear()  # reset association hysteresis when there is no vision lead to match against
 
   lead_dict = {'status': False}
   if track is not None:
@@ -207,6 +247,7 @@ class RadarD:
     self.tracks: dict[int, Track] = {}
     self.kalman_params = KalmanParams(DT_MDL)
     self.lead_prob_filters = [FirstOrderFilter(0.0, 0.2, DT_MDL) for _ in range(2)]
+    self.lead_states: list[dict] = [{}, {}]  # per-lead radar<->vision association hysteresis state
 
     self.v_ego = 0.0
     self.v_ego_hist = deque([0.0], maxlen=int(round(delay / DT_MDL))+1)
@@ -267,9 +308,9 @@ class RadarD:
           self.lead_prob_filters[i].update(lead_prob)
 
       self.radar_state.leadOne = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[0], model_v_ego, self.lead_prob_filters[0].x,
-                                          self.CP, self.CP_SP, low_speed_override=True)
+                                          self.CP, self.CP_SP, low_speed_override=True, state=self.lead_states[0])
       self.radar_state.leadTwo = get_lead(self.v_ego, self.ready, self.tracks, leads_v3[1], model_v_ego, self.lead_prob_filters[1].x,
-                                          self.CP, self.CP_SP, low_speed_override=False)
+                                          self.CP, self.CP_SP, low_speed_override=False, state=self.lead_states[1])
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
