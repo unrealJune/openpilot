@@ -80,6 +80,16 @@ BUMPLESS_MAX_STEP = 8.0        # m; a bigger discontinuity is a genuine lead cha
 # can never mask a real closing that vision sees, and it no-ops when the native Doppler is unavailable.
 NATIVE_DOPPLER_FALSE_CLOSE_MARGIN = 1.5  # m/s: track must close this much harder than BOTH corroborators
 
+# --- vision closing floor (202605 vision-only parity on approach detection) ---
+# The mirror image of the Doppler guard: the fused radar vRel can UNDER-report a real closing (KF spin-up
+# on a freshly acquired track, or residual identity mixing in dense same-range scenes), which made the
+# fused stack notice an approach 1-2 s LATER than vision-only did (replay, drives 00000003/00000007).
+# When the confident vision lead claims meaningfully MORE closing than the fused track, adopt vision's
+# estimate -- exactly the signal the vision-only stack would have published, so approach-detection can
+# never be later than vision-only by construction. When radar sees MORE closing than vision (e.g. vision
+# night-blind at range), radar still wins: this floor only ever makes the published lead MORE cautious.
+VISION_CLOSING_FLOOR_MARGIN = 1.0  # m/s: vision must claim this much more closing before it overrides
+
 
 class KalmanParams:
   def __init__(self, dt: float):
@@ -264,6 +274,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
     lead_dict = track.get_RadarState(lead_prob)
     lead_dict = get_custom_yrel(CP, CP_SP, lead_dict, lead_msg)
     lead_dict = apply_native_doppler_guard(lead_dict, track, lead_msg, v_ego, model_v_ego)
+    lead_dict = apply_vision_closing_floor(lead_dict, lead_msg, v_ego, model_v_ego)
   elif (track is None) and ready and (lead_prob > .5):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob, radar_to_camera)
 
@@ -311,6 +322,21 @@ def apply_native_doppler_guard(lead_dict: dict[str, Any], track: 'Track',
     # The spurious closing also biased the tracked accel negative; a corroborated-absent closing is not a
     # real deceleration, so neutralize it to keep the correction internally consistent (no phantom brake).
     lead_dict['aLeadK'] = float(max(lead_dict['aLeadK'], 0.0))
+  return lead_dict
+
+
+def apply_vision_closing_floor(lead_dict: dict[str, Any], lead_msg: capnp._DynamicStructReader,
+                               v_ego: float, model_v_ego: float) -> dict[str, Any]:
+  # See VISION_CLOSING_FLOOR_MARGIN: a radar-fused lead may never report meaningfully LESS closing than
+  # the confident vision estimate it is fused to. Adopting vision's own vRel/vLead/aLead here is exactly
+  # what the vision-only (202605) stack would have published, so this can only move behavior TOWARD the
+  # known-good baseline -- and only in the cautious direction.
+  vis_vrel = float(lead_msg.v[0] - model_v_ego)
+  if vis_vrel < lead_dict['vRel'] - VISION_CLOSING_FLOOR_MARGIN:
+    lead_dict['vRel'] = vis_vrel
+    lead_dict['vLead'] = float(v_ego + vis_vrel)
+    lead_dict['vLeadK'] = float(v_ego + vis_vrel)
+    lead_dict['aLeadK'] = float(min(lead_dict['aLeadK'], lead_msg.a[0]))
   return lead_dict
 
 
