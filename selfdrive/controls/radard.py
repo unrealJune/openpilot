@@ -82,13 +82,40 @@ NATIVE_DOPPLER_FALSE_CLOSE_MARGIN = 1.5  # m/s: track must close this much harde
 
 # --- vision closing floor (202605 vision-only parity on approach detection) ---
 # The mirror image of the Doppler guard: the fused radar vRel can UNDER-report a real closing (KF spin-up
-# on a freshly acquired track, or residual identity mixing in dense same-range scenes), which made the
-# fused stack notice an approach 1-2 s LATER than vision-only did (replay, drives 00000003/00000007).
-# When the confident vision lead claims meaningfully MORE closing than the fused track, adopt vision's
-# estimate -- exactly the signal the vision-only stack would have published, so approach-detection can
-# never be later than vision-only by construction. When radar sees MORE closing than vision (e.g. vision
-# night-blind at range), radar still wins: this floor only ever makes the published lead MORE cautious.
-VISION_CLOSING_FLOOR_MARGIN = 1.0  # m/s: vision must claim this much more closing before it overrides
+# on a freshly acquired track), which made the fused stack notice an approach 1-2 s LATER than vision-only
+# did (replay, drives 00000003/00000007). When the confident vision lead claims meaningfully MORE closing
+# than the fused track, adopt vision's estimate.
+#
+# GUARDED (roadtrip 2026-07: routes 00000025/27/2a, 5.4 h): the unguarded floor was the primary phantom-
+# brake engine. Vision's lead-velocity estimate is zero-mean NOISY (junk during object re-locks); the
+# vision-only stack publishes both signs and the MPC averages it out, but a one-sided floor RECTIFIES that
+# noise -- keeping only the closing-side excursions on top of the radar's (shorter, accurate) range: a
+# composite estimate more aggressive than EITHER source alone. It fired on 20% of all fused frames (4779),
+# 362 of them against a direct native-Doppler contradiction (e.g. published -8 m/s while the Doppler read
+# -1 and the track's own vRel +0.4, on a steady 70 mph follow). Three guards restore the floor to its
+# actual purpose (KF spin-up on a fresh track) and kill the rectifier (replay on the 36 worst trip
+# segments: severe phantom closings 229 -> 14, planner-visible vLeadK steps 1411 -> 745):
+#   (a) same-object: vision's range must agree with the fused range, else the sources are mid-relock on
+#       different references and vision's velocity says nothing about THIS track;
+#   (b) Doppler veto: the radar's own native Doppler is an independent direct measurement of the SAME
+#       track -- when it contradicts vision's claimed closing, the claim is vision noise;
+#   (c) maturity: a converged KF does not under-report; only a freshly acquired track needs the floor.
+VISION_CLOSING_FLOOR_MARGIN = 1.0        # m/s: vision must claim this much more closing before it overrides
+VISION_FLOOR_RANGE_AGREE = 5.0           # m, guard (a): |vision dRel - fused dRel| must be under this
+VISION_FLOOR_DOPPLER_VETO = 1.5          # m/s, guard (b): vision closing this far below the native Doppler -> noise
+VISION_FLOOR_TRACK_MATURE_CNT = 15       # frames, guard (c): track KF converged -> floor not needed
+
+# --- sticky association (incumbent hold gate) ---
+# The association dist gate is evaluated against the low-passed vision distance every frame; at long range
+# the model's per-frame distance swings +-15 m (60-115 m leads, roadtrip replay), so the currently-fused
+# track kept falling out of the +-12 m gate and the published lead flapped radar<->vision once a second --
+# each flap a dRel/vLead step for the planner (shipped trip code: 637 source flips / 697 published dRel
+# down-steps >5 m across the 36 worst segments). The INCUMBENT track is corroborated by its own history,
+# so it gets a wider hold gate than candidates (acquire tight, hold loose). Replay: flips -24%, down-steps
+# -19% (below the vision-only baseline's own 838), radar coverage +2-12 pts, no phantom cost.
+MATCH_INCUMBENT_DIST_GATE_FACTOR = 0.35  # of smoothed vision distance (candidates use 0.25)
+MATCH_INCUMBENT_DIST_GATE_MIN = 8.0      # m (candidates use 5.0)
+MATCH_INCUMBENT_DIST_GATE_MAX = 20.0     # m (candidates use MATCH_VISION_DIST_GATE_MAX = 12)
 
 
 class KalmanParams:
@@ -201,10 +228,15 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
     # This isn't exactly right, but it's a good heuristic
     return prob_d * prob_y * prob_v
 
-  def is_sane(c):
+  def is_sane(c, incumbent: bool = False):
     # Cap the gate so a radar return that is much closer/farther than the vision lead (i.e. a different
     # object) is not fused to it. Stationary radar points can be false positives.
-    dist_gate = min(max(offset_vision_dist * .25, 5.0), MATCH_VISION_DIST_GATE_MAX)
+    if incumbent:
+      # sticky hold gate: see MATCH_INCUMBENT_DIST_GATE_* (acquire tight, hold loose)
+      dist_gate = min(max(offset_vision_dist * MATCH_INCUMBENT_DIST_GATE_FACTOR, MATCH_INCUMBENT_DIST_GATE_MIN),
+                      MATCH_INCUMBENT_DIST_GATE_MAX)
+    else:
+      dist_gate = min(max(offset_vision_dist * .25, 5.0), MATCH_VISION_DIST_GATE_MAX)
     dist_sane = abs(c.dRel - offset_vision_dist) < dist_gate
     vel_sane = (abs(c.vRel + v_ego - lead.v[0]) < 10) or (v_ego + c.vRel > 3)
     # A track laterally far from the vision lead is a DIFFERENT object no matter how well the range
@@ -213,9 +245,18 @@ def match_vision_to_track(v_ego: float, lead: capnp._DynamicStructReader, tracks
     lat_sane = abs(c.yRel + lead.y[0]) < lat_gate
     return dist_sane and vel_sane and lat_sane
 
+  incumbent_id = state.get('track_id', -1)
   track = max(tracks.values(), key=prob)
   if not is_sane(track):
     track = None
+  # sticky association: when NO track passes the candidate gates (a vision range-noise excursion, not a
+  # real lead change) but the incumbent track is still alive and within its (wider) hold gate, keep the
+  # incumbent instead of flapping the published lead radar<->vision. A sane DIFFERENT candidate (real
+  # lead change, e.g. cut-in) is NOT overridden -- it switches through the normal hysteresis below.
+  if track is None and incumbent_id != -1:
+    inc = tracks.get(incumbent_id)
+    if inc is not None and is_sane(inc, incumbent=True):
+      track = inc
 
   # Association hysteresis: require a *new* radar track to be the best sane match for MATCH_SWITCH_FRAMES
   # consecutive frames before it becomes the fused lead, holding the current one meanwhile. This stops
@@ -274,7 +315,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
     lead_dict = track.get_RadarState(lead_prob)
     lead_dict = get_custom_yrel(CP, CP_SP, lead_dict, lead_msg)
     lead_dict = apply_native_doppler_guard(lead_dict, track, lead_msg, v_ego, model_v_ego)
-    lead_dict = apply_vision_closing_floor(lead_dict, lead_msg, v_ego, model_v_ego)
+    lead_dict = apply_vision_closing_floor(lead_dict, track, lead_msg, v_ego, model_v_ego, radar_to_camera)
   elif (track is None) and ready and (lead_prob > .5):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob, radar_to_camera)
 
@@ -325,18 +366,31 @@ def apply_native_doppler_guard(lead_dict: dict[str, Any], track: 'Track',
   return lead_dict
 
 
-def apply_vision_closing_floor(lead_dict: dict[str, Any], lead_msg: capnp._DynamicStructReader,
-                               v_ego: float, model_v_ego: float) -> dict[str, Any]:
-  # See VISION_CLOSING_FLOOR_MARGIN: a radar-fused lead may never report meaningfully LESS closing than
-  # the confident vision estimate it is fused to. Adopting vision's own vRel/vLead/aLead here is exactly
-  # what the vision-only (202605) stack would have published, so this can only move behavior TOWARD the
-  # known-good baseline -- and only in the cautious direction.
+def apply_vision_closing_floor(lead_dict: dict[str, Any], track: 'Track', lead_msg: capnp._DynamicStructReader,
+                               v_ego: float, model_v_ego: float,
+                               radar_to_camera: float = RADAR_TO_CAMERA) -> dict[str, Any]:
+  # See VISION_CLOSING_FLOOR_MARGIN / VISION_FLOOR_*: adopt vision's more-closing estimate ONLY in the
+  # case the floor exists for -- a freshly acquired track whose KF is still spinning up -- and only when
+  # vision is talking about the same object and the radar's own Doppler does not contradict the claim.
+  # Unguarded, this floor rectified vision's velocity noise into phantom closings on 20% of fused frames
+  # (the roadtrip phantom-brake root cause; see the constant block above).
   vis_vrel = float(lead_msg.v[0] - model_v_ego)
-  if vis_vrel < lead_dict['vRel'] - VISION_CLOSING_FLOOR_MARGIN:
-    lead_dict['vRel'] = vis_vrel
-    lead_dict['vLead'] = float(v_ego + vis_vrel)
-    lead_dict['vLeadK'] = float(v_ego + vis_vrel)
-    lead_dict['aLeadK'] = float(min(lead_dict['aLeadK'], lead_msg.a[0]))
+  if vis_vrel >= lead_dict['vRel'] - VISION_CLOSING_FLOOR_MARGIN:
+    return lead_dict
+  # (a) same-object: vision's range must agree with the fused range
+  if abs(float(lead_msg.x[0]) - radar_to_camera - lead_dict['dRel']) >= VISION_FLOOR_RANGE_AGREE:
+    return lead_dict
+  # (b) Doppler veto: the radar's own native Doppler contradicts vision's claimed closing -> vision noise
+  vrn = getattr(track, 'vRelNative', float('nan'))
+  if math.isfinite(vrn) and vis_vrel < vrn - VISION_FLOOR_DOPPLER_VETO:
+    return lead_dict
+  # (c) maturity: a converged KF does not under-report closing; the floor is for spin-up only
+  if track.cnt >= VISION_FLOOR_TRACK_MATURE_CNT:
+    return lead_dict
+  lead_dict['vRel'] = vis_vrel
+  lead_dict['vLead'] = float(v_ego + vis_vrel)
+  lead_dict['vLeadK'] = float(v_ego + vis_vrel)
+  lead_dict['aLeadK'] = float(min(lead_dict['aLeadK'], lead_msg.a[0]))
   return lead_dict
 
 
