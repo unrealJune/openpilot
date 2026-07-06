@@ -55,8 +55,14 @@ MATCH_SWITCH_FRAMES = 3             # a newly-matched radar track must persist t
 # (scale is calibrated at MEDIUM confidence; far tracks can sit meters off laterally), so far leads get a
 # wider gate rather than losing fusion entirely. Replay-validated on drives 00000003/00000005/00000007:
 # true-phantom closings 87 -> 24 with ~4 pts fused-coverage cost (radar defers to vision when unsure).
-MATCH_VISION_LAT_GATE_BASE = 2.5    # m, lateral gate at/below LAT_GATE_START
-MATCH_VISION_LAT_GATE_SLOPE = 0.05  # m of extra gate per meter of range beyond LAT_GATE_START
+# TIGHTENED (post-deploy drives 2026-07-06, routes 2b/2d): with the azimuth scale now calibrated
+# (opendbc yRel sign flip + 0.001186 deg/LSB) the previous 2.5+0.05/m gate reached 4.0 m at 50 m -- wider
+# than a lane -- and let adjacent-lane tracks fuse to the in-path vision lead (the on-screen chevron
+# visibly jumped to the neighboring car; drive 2b--2 t=48-58 s). Sub-lane at range now that yRel is
+# trustworthy. Replay on 2b/2c/2d: wrong-car fused frames (|yRel + vision y| > 2 m) 102 -> 29, severe
+# rectification deficit 13 -> 9, at +9 source flips / +7 down-steps (bumpless absorbs them).
+MATCH_VISION_LAT_GATE_BASE = 2.0    # m, lateral gate at/below LAT_GATE_START
+MATCH_VISION_LAT_GATE_SLOPE = 0.02  # m of extra gate per meter of range beyond LAT_GATE_START
 MATCH_VISION_LAT_GATE_START = 20.0  # m
 
 # Bumpless source transfer for the published lead. The fused (radar) and vision-only estimates of the
@@ -116,6 +122,27 @@ VISION_FLOOR_TRACK_MATURE_CNT = 15       # frames, guard (c): track KF converged
 MATCH_INCUMBENT_DIST_GATE_FACTOR = 0.35  # of smoothed vision distance (candidates use 0.25)
 MATCH_INCUMBENT_DIST_GATE_MIN = 8.0      # m (candidates use 5.0)
 MATCH_INCUMBENT_DIST_GATE_MAX = 20.0     # m (candidates use MATCH_VISION_DIST_GATE_MAX = 12)
+
+# --- evidence clamp (post-deploy drives 2026-07-06, routes 2b/2c/2d) ---
+# The Honda Bosch-A fine track publishes NO per-track Doppler; its vRel is a KF differentiating a
+# held/quantized range staircase (~0.1 m steps, 0.3-0.7 s holds). On a steady ~26 m follow that KF RINGS
+# +-2.4 m/s around the true rate and overshoots ~2x when the lead slows gently, and the radard lead KF
+# turns the ringing into aLeadK swings of -3..-5 m/s^2 while vision sees the lead at ~0 -- the planner
+# then brakes hard ("as soon as the lead slows a little we phantom brake"; 9 of 14 engaged hard-decel
+# events on these drives, one ending in a user brake-tap disengage, one in a gas override). Fix: the
+# published closing may never exceed the most-closing CREDIBLE evidence by more than a margin.
+#   evidence = min(vision vRel [only when vision's range agrees -> same object],
+#                  native Doppler vRelNative [parser-gated, slot-0/selected lead only])
+# Real braking passes untouched: vision sees a real closing, so the evidence floor is deep (replay:
+# realmiss 263 -> 264, i.e. no masking added). The floor is low-passed (vision vRel is +-1 m/s noisy at
+# 20 Hz; a raw floor would inject that noise into vLeadK while clamped). aLeadK is banded to vision's
+# lead-accel estimate for the same reason (its ringing is pure differentiation noise).
+# Replay 2b/2c/2d: overclose frames (fused closing >1.5 m/s beyond a range-agreeing, non-closing vision
+# lead) 554 -> 348; aLeadK-vs-vision disagreement >2 m/s^2: 1096 -> 30; phantom injections 48 -> 36.
+EVCLAMP_VREL_MARGIN = 1.0    # m/s below the evidence floor the published vRel may sit
+EVCLAMP_ACC_MARGIN = 1.0     # m/s^2 band around vision's lead accel for aLeadK
+EVCLAMP_RANGE_AGREE = 5.0    # m, vision same-object gate (mirrors VISION_FLOOR_RANGE_AGREE)
+EVCLAMP_FLOOR_RC = 0.2       # s, low-pass on the evidence floor
 
 
 class KalmanParams:
@@ -316,6 +343,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
     lead_dict = get_custom_yrel(CP, CP_SP, lead_dict, lead_msg)
     lead_dict = apply_native_doppler_guard(lead_dict, track, lead_msg, v_ego, model_v_ego)
     lead_dict = apply_vision_closing_floor(lead_dict, track, lead_msg, v_ego, model_v_ego, radar_to_camera)
+    lead_dict = apply_evidence_clamp(lead_dict, track, lead_msg, v_ego, model_v_ego, lead_prob, state, radar_to_camera)
   elif (track is None) and ready and (lead_prob > .5):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob, radar_to_camera)
 
@@ -391,6 +419,40 @@ def apply_vision_closing_floor(lead_dict: dict[str, Any], track: 'Track', lead_m
   lead_dict['vLead'] = float(v_ego + vis_vrel)
   lead_dict['vLeadK'] = float(v_ego + vis_vrel)
   lead_dict['aLeadK'] = float(min(lead_dict['aLeadK'], lead_msg.a[0]))
+  return lead_dict
+
+
+def apply_evidence_clamp(lead_dict: dict[str, Any], track: 'Track', lead_msg: capnp._DynamicStructReader,
+                         v_ego: float, model_v_ego: float, lead_prob: float, state: dict,
+                         radar_to_camera: float = RADAR_TO_CAMERA) -> dict[str, Any]:
+  # See the EVCLAMP_* block: bound the published closing speed and lead accel of a radar-fused lead by
+  # the independent evidence (range-agreeing vision + native Doppler), because this radar's derived vRel
+  # rings on its quantized range and radard's lead KF amplifies the ringing into phantom decelerations.
+  # No evidence available (vision range-disagrees AND no native Doppler) -> untouched.
+  evidence = []
+  vis_ok = (lead_prob > 0.5 and
+            abs(float(lead_msg.x[0]) - radar_to_camera - lead_dict['dRel']) < EVCLAMP_RANGE_AGREE)
+  if vis_ok:
+    evidence.append(float(lead_msg.v[0] - model_v_ego))
+  vrn = getattr(track, 'vRelNative', float('nan'))
+  if math.isfinite(vrn):
+    evidence.append(float(vrn))
+  if evidence:
+    raw_floor = min(evidence) - EVCLAMP_VREL_MARGIN
+    f_prev = state.get('ev_floor')
+    alpha = DT_MDL / (EVCLAMP_FLOOR_RC + DT_MDL)
+    floor_v = raw_floor if f_prev is None else f_prev + alpha * (raw_floor - f_prev)
+    state['ev_floor'] = floor_v
+    if lead_dict['vRel'] < floor_v:
+      lead_dict['vRel'] = float(floor_v)
+      lead_dict['vLead'] = float(v_ego + floor_v)
+      lead_dict['vLeadK'] = float(v_ego + floor_v)
+  else:
+    state.pop('ev_floor', None)
+  if vis_ok:
+    vis_a = float(lead_msg.a[0])
+    lead_dict['aLeadK'] = float(min(max(lead_dict['aLeadK'], vis_a - EVCLAMP_ACC_MARGIN),
+                                    vis_a + EVCLAMP_ACC_MARGIN))
   return lead_dict
 
 
