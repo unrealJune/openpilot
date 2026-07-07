@@ -144,6 +144,50 @@ EVCLAMP_ACC_MARGIN = 1.0     # m/s^2 band around vision's lead accel for aLeadK
 EVCLAMP_RANGE_AGREE = 5.0    # m, vision same-object gate (mirrors VISION_FLOOR_RANGE_AGREE)
 EVCLAMP_FLOOR_RC = 0.2       # s, low-pass on the evidence floor
 
+# --- L1: broaden the Doppler evidence source (Honda/Acura Bosch-A) ---
+# The doppler guard, vision floor and evidence clamp above are all ASYMMETRIC, vision-gated corrections
+# that lean on the radar's native Doppler as an independent closing measurement. But they read
+# track.vRelNative, which opendbc attaches to slot 0 ONLY (agreement-gated) -- NaN on ~64% of closer-ghost
+# frames, because the ghost is a DIFFERENT slot than the radar's ACC pick, so exactly when the phantom
+# fires the guards have no Doppler and go silent. opendbc now also exposes the selected-lead (ACC-target)
+# Doppler on EVERY fused slot as vRelSelected (a per-cycle scalar, ~94% of frames). Preferring it as the
+# guards' Doppler source widens their coverage from the slot0 case to the ghost case they were missing,
+# WITHOUT changing their nature: they still only ever REDUCE closing that neither the Doppler nor a
+# range-agreeing vision lead supports (never add closing), so no new phantom brake can be introduced and a
+# real closing either source confirms is preserved. Falls back to vRelNative, then NaN -> on non-Bosch-A
+# cars both are NaN and behaviour is byte-for-byte unchanged. RX-only; factory AEB/CMBS untouched.
+def _radar_doppler(track: 'Track') -> float:
+  # The best available radar Doppler for the fused track: the broadly-exposed selected-lead (ACC-target)
+  # Doppler when present, else this track's own slot0 native Doppler, else NaN.
+  vsel = getattr(track, 'vRelSelected', float('nan'))
+  if math.isfinite(vsel):
+    return vsel
+  return getattr(track, 'vRelNative', float('nan'))
+
+# --- L2: de-ghost the lead acceleration (Honda/Acura Bosch-A) ---
+# aLeadK is radard's lead KF differentiating vLead, whose vRel is ITSELF opendbc's finite-difference of a
+# quantized range staircase (~0.1 m steps, 0.3-0.7 s holds). A large |aLeadK| is therefore a DOUBLE
+# derivative of a stairstep -- almost always ringing, not real lead braking (worst seen -6.4 m/s^2 on a
+# provably steady lead). The evidence clamp already bands aLeadK to vision's smooth lead accel, but ONLY on
+# frames where vision RANGE-AGREES; the worst phantom-decel spikes are exactly the closer-ghost frames where
+# it does not, so they reach the planner. L2 bands aLeadK on ALL Bosch-A fused frames: to the range-agreeing
+# vision lead's accel when available, else to a zero-centred band -- so an UNcorroborated large decel (pure
+# ring) can never reach the planner. It touches ONLY aLeadK: velocity/closing (dRel, vRel, vLeadK) is
+# untouched, so real car-following is unaffected and only fabricated decel is removed. Real braking passes
+# because when vision confirms it (range-agree) the band centres on vision's accel; the factory AEB/CMBS
+# remains the independent backstop for any true emergency the coarse fused estimate would under-drive.
+L2_ALEADK_BAND = 1.0    # m/s^2: half-width of the aLeadK band (matches EVCLAMP_ACC_MARGIN)
+L2_RANGE_AGREE = 5.0    # m: vision same-object gate for centring the band on vision's lead accel
+
+
+def apply_bosch_a_accel_deghost(lead_dict: dict[str, Any], lead_msg: capnp._DynamicStructReader, lead_prob: float,
+                                radar_to_camera: float = RADAR_TO_CAMERA) -> dict[str, Any]:
+  # See the L2 block above. Bosch-A only (gated by the caller).
+  vis_ok = (lead_prob > 0.5 and abs(float(lead_msg.x[0]) - radar_to_camera - lead_dict['dRel']) < L2_RANGE_AGREE)
+  center = float(lead_msg.a[0]) if vis_ok else 0.0
+  lead_dict['aLeadK'] = float(min(max(lead_dict['aLeadK'], center - L2_ALEADK_BAND), center + L2_ALEADK_BAND))
+  return lead_dict
+
 
 class KalmanParams:
   def __init__(self, dt: float):
@@ -177,9 +221,10 @@ class Track:
     self.K_K = kalman_params.K
     self.kf = KF1D([[v_lead], [0.0]], self.K_A, self.K_C, self.K_K)
     self.vRelNative = float('nan')  # radar's native Doppler for this track (NaN if the radar doesn't publish one)
+    self.vRelSelected = float('nan')  # radar's selected-lead (ACC-target) Doppler this cycle (L1; NaN when none)
 
   def update(self, d_rel: float, y_rel: float, v_rel: float, v_lead: float, measured: float,
-             v_rel_native: float = float('nan')):
+             v_rel_native: float = float('nan'), v_rel_selected: float = float('nan')):
     # relative values, copy
     self.dRel = d_rel   # LONG_DIST
     self.yRel = y_rel   # -LAT_DIST
@@ -187,6 +232,7 @@ class Track:
     self.vLead = v_lead
     self.measured = measured   # measured or estimate
     self.vRelNative = v_rel_native  # radar-published Doppler (RX-only cross-check; NaN when unavailable)
+    self.vRelSelected = v_rel_selected  # selected-lead Doppler reference for L1 authority (NaN when unavailable)
 
     # computed velocity and accelerations
     if self.cnt > 0:
@@ -344,6 +390,10 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
     lead_dict = apply_native_doppler_guard(lead_dict, track, lead_msg, v_ego, model_v_ego)
     lead_dict = apply_vision_closing_floor(lead_dict, track, lead_msg, v_ego, model_v_ego, radar_to_camera)
     lead_dict = apply_evidence_clamp(lead_dict, track, lead_msg, v_ego, model_v_ego, lead_prob, state, radar_to_camera)
+    # L2 (Bosch-A): band the ring-prone lead accel even when vision does not range-agree (the worst phantom
+    # spikes). aLeadK-only; velocity is untouched. Runs last so it bounds the final published aLeadK.
+    if CP.carFingerprint in HONDA_BOSCH_A:
+      lead_dict = apply_bosch_a_accel_deghost(lead_dict, lead_msg, lead_prob, radar_to_camera)
   elif (track is None) and ready and (lead_prob > .5):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego, lead_prob, radar_to_camera)
 
@@ -375,7 +425,7 @@ def apply_native_doppler_guard(lead_dict: dict[str, Any], track: 'Track',
   # INDEPENDENT closing-speed estimates. When BOTH say the lead is closing meaningfully less than the
   # track's vRel claims, the closing is an artifact -> damp the fused lead to the corroborated velocity.
   # No-op when the native Doppler is unavailable (NaN), so it only affects cars/tracks that publish one.
-  vrn = getattr(track, 'vRelNative', float('nan'))
+  vrn = _radar_doppler(track)
   if not math.isfinite(vrn):
     return lead_dict
   vrel = lead_dict['vRel']
@@ -409,7 +459,7 @@ def apply_vision_closing_floor(lead_dict: dict[str, Any], track: 'Track', lead_m
   if abs(float(lead_msg.x[0]) - radar_to_camera - lead_dict['dRel']) >= VISION_FLOOR_RANGE_AGREE:
     return lead_dict
   # (b) Doppler veto: the radar's own native Doppler contradicts vision's claimed closing -> vision noise
-  vrn = getattr(track, 'vRelNative', float('nan'))
+  vrn = _radar_doppler(track)
   if math.isfinite(vrn) and vis_vrel < vrn - VISION_FLOOR_DOPPLER_VETO:
     return lead_dict
   # (c) maturity: a converged KF does not under-report closing; the floor is for spin-up only
@@ -434,7 +484,7 @@ def apply_evidence_clamp(lead_dict: dict[str, Any], track: 'Track', lead_msg: ca
             abs(float(lead_msg.x[0]) - radar_to_camera - lead_dict['dRel']) < EVCLAMP_RANGE_AGREE)
   if vis_ok:
     evidence.append(float(lead_msg.v[0] - model_v_ego))
-  vrn = getattr(track, 'vRelNative', float('nan'))
+  vrn = _radar_doppler(track)
   if math.isfinite(vrn):
     evidence.append(float(vrn))
   if evidence:
@@ -527,7 +577,8 @@ class RadarD:
       self.v_ego_hist.append(self.v_ego)
       self.last_v_ego_frame = sm.recv_frame['carState']
 
-    ar_pts = {pt.trackId: [pt.dRel, pt.yRel, pt.vRel, pt.measured, getattr(pt, 'vRelNative', float('nan'))] for pt in rr.points}
+    ar_pts = {pt.trackId: [pt.dRel, pt.yRel, pt.vRel, pt.measured, getattr(pt, 'vRelNative', float('nan')),
+                           getattr(pt, 'vRelSelected', float('nan'))] for pt in rr.points}
 
     # *** remove missing points from meta data ***
     for ids in list(self.tracks.keys()):
@@ -544,7 +595,7 @@ class RadarD:
       # create the track if it doesn't exist or it's a new track
       if ids not in self.tracks:
         self.tracks[ids] = Track(ids, v_lead, self.kalman_params)
-      self.tracks[ids].update(rpt[0], rpt[1], rpt[2], v_lead, rpt[3], rpt[4])
+      self.tracks[ids].update(rpt[0], rpt[1], rpt[2], v_lead, rpt[3], rpt[4], rpt[5])
 
     # *** publish radarState ***
     self.radar_state_valid = sm.all_checks()
