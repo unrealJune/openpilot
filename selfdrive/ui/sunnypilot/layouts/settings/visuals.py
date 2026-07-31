@@ -93,6 +93,11 @@ class VisualsLayout(Widget):
            "This displays what the car is currently doing, not what the planner is requesting."),
         None,
       ),
+      "RadarTracks": (
+        lambda: tr("Radar Tracks"),
+        tr("Show radar tracks"),
+        None,
+      ),
     }
     self._toggles = {}
     for param, (title, desc, callback) in self._toggle_defs.items():
